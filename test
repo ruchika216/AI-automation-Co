@@ -1,8 +1,111 @@
-The objective of this test assignment is to implement mobile app screens. Examples and steps are given below:
-Discover screen
-Profile Screen
-Both screens are to be referenced from “BWStory” in the Play Store.
-Play store url: https://play.google.com/store/apps/details?id=com.blackcoffer.bnews&hl=en_IN 
-Build UI of two screens only
-Build APK and share it with us in your submission
-You can use Firebase or Subabase as backend if needed
+You are an expert medical educator and presentation designer.
+
+I will provide an attached PDF. Your task is to create a complete PowerPoint presentation based on:
+
+1. The attached PDF (primary source)
+2. Standard nursing knowledge aligned with Saunders NCLEX (for structure, sequencing, and clinical accuracy)
+
+---
+
+🎯 OBJECTIVE:
+
+Generate a well-structured, modern PowerPoint presentation (50+ slides if needed) that:
+
+- Covers ALL topics from the PDF (do not miss any topic)
+- Does NOT copy-paste text directly
+- Uses clear, concise bullet points
+- Is NCLEX-oriented and clinically structured
+
+---
+
+📚 CONTENT RULES:
+
+- First include Anatomy & Physiology
+- Then include Disorders (system-wise or topic-wise)
+- Immediately follow each disorder with:
+  - Medications related to that disorder (VERY IMPORTANT)
+
+Example flow (STRICT):
+
+- Diabetes Mellitus → then Insulin + Oral Hypoglycemics
+- Thyroid Disorders → then Thyroid Medications
+- Cardiac Disorders → then Cardiac Drugs
+- Respiratory Disorders → then Respiratory Drugs
+
+Follow this Saunders NCLEX-style integration strictly
+
+---
+
+🧠 CONTENT DEPTH:
+
+For each disorder include:
+
+- Definition
+- Causes / Risk Factors
+- Pathophysiology (brief, simplified)
+- Signs & Symptoms
+- Diagnostics
+- Nursing Management
+- Medications (mechanism, examples, key nursing points)
+
+---
+
+🖼️ IMAGES & VISUALS:
+
+- Extract and use relevant images/diagrams from the PDF wherever applicable
+- If needed, suggest where diagrams should be placed
+- Use visuals for:
+  - Anatomy
+  - Disease mechanisms
+  - Drug actions
+
+---
+
+🎨 DESIGN INSTRUCTIONS:
+
+- Use a modern, minimal theme
+- Simple color palette (2–3 colors max, soft tones)
+- Clean layouts (no clutter)
+- Use:
+  - Section divider slides
+  - Icons (if possible)
+  - Visual hierarchy (headings > bullets)
+
+---
+
+⚙️ OUTPUT FORMAT:
+
+Generate slide-wise content like:
+
+Slide 1: Title
+Slide 2: Objectives
+Slide 3: Anatomy – [Topic]
+Slide 4: Anatomy continued
+...
+
+Each slide should:
+
+- Have a clear title
+- 4–6 bullet points max
+- Concise wording
+
+---
+
+⚠️ IMPORTANT RULES:
+
+- DO NOT skip any topic from the PDF
+- DO NOT dump long paragraphs
+- DO NOT exceed token limits unnecessarily (be concise but complete)
+- Maintain logical flow and grouping
+- Ensure medical accuracy
+
+---
+
+FINAL GOAL:
+
+A ready-to-use, exam-focused, visually clean, logically structured PPT aligned with:
+
+- The provided PDF
+- Saunders NCLEX framework
+
+Now wait for the PDF and begin once it is provided.
