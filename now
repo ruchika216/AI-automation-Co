@@ -1,0 +1,37 @@
+drops.append("DROP EXTERNAL TABLE IF EXISTS (ext)^;")
+
+cm = c.lower(): c for c in cols}
+
+d2 = cm.get('date', 'date2')
+
+dp =
+
+# State: mm/dd/YYYY first, then slash dd/mm/yy, then dash variants
+
+f"COALESCE("
+
+F"SAFE_CAST({d2} AS DATE),"
+
+f"SAFE.PARSE_DATE('%m/%d/%Y',CAST({d2}` AS STRING)),
+
+f"SAFE.PARSE_DATE('%d-%m-%Y', CAST({d2} AS STRING)),
+
+f"SAFE.PARSE_DATE('%m-%d-%Y', CAST(d2) AS STRING)))"
+
+if scope=="state" else
+
+# National: dd/mm/yy first, then mm/dd/YYYY, then dash variants (cove
+
+F"COALESCE("
+
+f"SAFE_CAST({d2} AS DATE),"
+
+f"SAFE.PARSE_DATE('%d-%m-%Y',CAST(d2} AS STRING)),"
+
+f"SAFE.PARSE_DATE('%m/%d/%Y',CAST(`{d2} AS STRING)),"
+
+f"SAFE.PARSE_DATE('%m-%d-%Y',CAST((d2) AS STRING)))"
+
+cex
+
+=join(
