@@ -1,0 +1,12 @@
+Looking at the data,I can see the issue clearly:
+
+National table: dates like 31-10-2018 are in DD-MM-YYYY format
+State table: dates like 9/30/2023 are in M/DD/YYYY format
+
+The problem is in the dp (date parsing) logic in build_sql. The current COALESCE tries SAFE_CAST first, which is incorrectly parsing 31-10-2018 — BigQuery's SAFE_CAST interprets ambiguous date strings as YYYY-MM-DD, so 0023-09-30 comes out instead of 2023-09-30.
+The fix: remove SAFE_CAST as the first fallback (it's causing the misparse) and ensure the explicit format strings cover all real patterns.Ran 2 commands, edited a fileRan 2 commands, edited a fileThe file isn't physically uploaded — it came through as text in the document block. I'll apply the fix directly and create the corrected file.Ran 2 commands, read a fileRan 2 commands, read a fileRoot cause: SAFE_CAST(\date2` AS DATE)was the first option in both COALESCE chains. BigQuery'sSAFE_CASTinterprets any string it receives asYYYY-MM-DD— so31-10-2018got read as year0031, month 10, day 18, producing 0031-10-18(mangled further to0023-09-30` due to field misalignment).
+The fix (in build_sql, the dp expression):
+
+Removed SAFE_CAST entirely from both state and national COALESCE chains
+State now uses explicit %m/%d/%Y → %m/%d/%y → dash variants — matching the actual format 9/30/2023
+National now uses explicit %d-%m-%Y → %d/%m/%Y → two-digit year variants — matching the actual format 31-10-2018, which correctly produces 2018-10-31
