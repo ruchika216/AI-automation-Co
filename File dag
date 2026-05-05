@@ -1,0 +1,338 @@
+"""DAG 1: Macro Data Ingestion — Pub/Sub / Config → GCS CSV → BigQuery MERGE"""
+#! airflow
+import sys, os
+from lumi.dag import DAG
+from lumi.bigQueryInsertJobOperator import BigQueryInsertJobOperator
+from airflow.providers.google.cloud.operators.pubsub import PubSubPullOperator
+from airflow.providers.google.cloud.sensors.gcs import GCSObjectsWithPrefixExistenceSensor
+from airflow.operators.python import PythonOperator
+from airflow.utils.trigger_rule import TriggerRule
+from airflow.utils.dates import days_ago
+from airflow.models import Variable
+from google.cloud import storage, pubsub_v1
+from datetime import timedelta
+import json, logging, base64
+
+sys.path.append(os.path.dirname(__file__))
+sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
+from utils.scheduler_common import load_config
+
+# ── Dynamic config (reference pattern: sp_generate_macro_tables) ──
+config      = load_config()
+PROJECT_ID  = config['project_id']
+DATASET     = config['data_dataset_name']
+bucket_name = Variable.get("GCP_PROJECT")
+BUCKET      = f"{bucket_name}-fast"
+DEST_TABLE  = f'{PROJECT_ID}.{DATASET}.fast_alt_macros'
+REG_TABLE   = f'{PROJECT_ID}.{DATASET}.fast_exec_inp_da_regis'
+TOPIC = 'LUMI_IN_FAST_TriggerInput'
+SUB = 'macro-ingestion-sub-v2'
+PREFIX = 'macro_files/'
+DATA_COLS = ['BK_P','PCE_N','DJTSMI','GDP_N','DPI_N','CP_IVACCA',
+             'HPI','UE','PCE_R','GDP_R','IP','DPI_R','RXD','RGDP_US','rgdp_ts','Dt_Temp']
+KEY_COLS = {'scen','date2','state_cd','country_cd'}
+log = logging.getLogger("airflow.task")
+
+# ── Helpers ──
+def _classify(name):
+    """Files always start with S_ (state) or N_ (national)."""
+    n = (name or "").upper()
+    if n.startswith("S_"): return "state"
+    if n.startswith("N_"): return "country"
+    return "unknown"
+
+def _delim(line):
+    for d in ['\t','|',';']:
+        if d in line and line.count(d) > line.count(','): return d
+    return ','
+
+def _parse_msg(raw):
+    """Decode Pub/Sub message: handles base64, nested dict, plain JSON."""
+    if isinstance(raw, dict):
+        data = raw.get('data') or raw.get('message',{}).get('data','')
+        if data:
+            try: return json.loads(base64.b64decode(data))
+            except: pass
+        if 'parentBatchId' in raw: return raw
+    if isinstance(raw, str):
+        try: return json.loads(raw)
+        except:
+            try: return json.loads(base64.b64decode(raw))
+            except: pass
+    return None
+
+# ══════════════════════════════════════════════════════════════
+# TASK 1: Parse input — Pub/Sub message OR dag_run.conf
+# ══════════════════════════════════════════════════════════════
+def check_msg(**ctx):
+    ti = ctx['ti']
+    dag_conf = ctx.get('dag_run').conf if ctx.get('dag_run') else {}
+
+    # ── Source 1: Pub/Sub ──
+    payload, ack_id = None, None
+    pull = ti.xcom_pull(task_ids='pull_pubsub_message')
+    msgs = pull.get('messages', pull.get('receivedMessages', [])) if isinstance(pull, dict) else (pull if isinstance(pull, list) else [])
+    if msgs:
+        msg = msgs[0]
+        payload = _parse_msg(msg)
+        if isinstance(msg, dict):
+            ack_id = msg.get('ackId') or msg.get('ack_id')
+        if payload:
+            log.info("[DAG1] Using Pub/Sub message")
+
+    # ── Source 2: dag_run.conf (manual trigger) ──
+    if not payload and dag_conf:
+        payload = dag_conf
+        log.info("[DAG1] No Pub/Sub message — using dag_run.conf")
+
+    # ── No input at all → FAIL ──
+    if not payload:
+        log.error("[DAG1] No Pub/Sub message and no dag_run.conf provided")
+        raise ValueError("DAG triggered without any input. Provide a Pub/Sub message or trigger with config.")
+
+    # ── Save ack_id if from Pub/Sub ──
+    if ack_id:
+        ti.xcom_push(key='ack_id', value=ack_id)
+
+    # ── Extract fields (works for both Pub/Sub and config payloads) ──
+    uid = str(payload.get('parentBatchId') or payload.get('messageId',''))
+    if not uid:
+        raise ValueError("Payload missing 'parentBatchId' or 'messageId'")
+
+    fd_raw = payload.get("formData", "{}")
+    fd = json.loads(fd_raw) if isinstance(fd_raw, str) else (fd_raw if isinstance(fd_raw, dict) else {})
+    pid = str(payload.get("parentBatchId","UNKNOWN")).replace("'","''")
+    cb = str(payload.get("createdBy","UNKNOWN")).replace("'","''")
+    mt = str(fd.get("macroType","UNKNOWN")).replace("'","''")
+    usafe = uid.replace("'","''")
+
+    ti.xcom_push(key='uuid', value=uid)
+    ti.xcom_push(key='pid', value=pid)
+    ti.xcom_push(key='cb', value=cb)
+    ti.xcom_push(key='mt', value=mt)
+
+    # ── File URIs (from formData fields) ──
+    uris, hints = [], {}
+    sf = str(fd.get("stateFile","")).strip()
+    nf = str(fd.get("nationalFile","")).strip()
+    if sf:
+        u = f"gs://{BUCKET}/{PREFIX}{sf}"; uris.append(u); hints[u] = "state"
+        log.info(f"[DAG1] State file: {sf}")
+    if nf:
+        u = f"gs://{BUCKET}/{PREFIX}{nf}"; uris.append(u); hints[u] = "country"
+        log.info(f"[DAG1] National file: {nf}")
+    if not uris:
+        log.info("[DAG1] No specific files in payload — will scan macro_files/ bucket")
+
+    ti.xcom_push(key='uris', value=uris)
+    ti.xcom_push(key='hints', value=hints)
+    # ── GCS sensor prefix: use actual folder from payload URIs if available,
+    #    else fall back to the default macro_files/ scan prefix ──
+    if uris:
+        # Extract folder prefix from first URI so sensor watches the right path
+        first_path = uris[0].replace(f"gs://{BUCKET}/", "")
+        gcs_pfx = '/'.join(first_path.split('/')[:-1]) + '/' if '/' in first_path else PREFIX
+    else:
+        gcs_pfx = PREFIX
+    ti.xcom_push(key='gcs_pfx', value=gcs_pfx)
+
+    # ── Registry SQL ──
+    file_names = [f for f in [sf, nf] if f]
+    rj = json.dumps(payload, default=str).replace("'","''").replace("\\","\\\\")
+    sj = json.dumps({"uuid":uid,"dest":DEST_TABLE,"macro_type":mt,"csv_files":file_names}, default=str).replace("'","''").replace("\\","\\\\")
+    ti.xcom_push(key='init_sql', value=f"""
+        MERGE `{REG_TABLE}` T USING (SELECT '{pid}' AS exec_id, CURRENT_TIMESTAMP() AS exec_strt_ts,
+        '{cb}' AS subm_by, '{rj}' AS raw_config_json, '{sj}' AS synced_config_json,
+        'IN_PROGRESS' AS inp_sta, CURRENT_TIMESTAMP() AS last_updated) S ON T.exec_id=S.exec_id
+        WHEN NOT MATCHED THEN INSERT(task_instnc_id,exec_id,exec_strt_ts,subm_by,raw_config_json,synced_config_json,inp_sta,last_updated)
+        VALUES(GENERATE_UUID(),S.exec_id,S.exec_strt_ts,S.subm_by,S.raw_config_json,S.synced_config_json,S.inp_sta,S.last_updated)
+        WHEN MATCHED AND T.inp_sta NOT IN('IN_PROGRESS','COMPLETED') THEN UPDATE SET
+        T.inp_sta='IN_PROGRESS',T.synced_config_json=S.synced_config_json,T.last_updated=CURRENT_TIMESTAMP();
+    """)
+    ti.xcom_push(key='fail_sql', value=f"UPDATE `{REG_TABLE}` SET inp_sta='FAILED',err_msg='Ingestion failed uuid={usafe}',last_updated=CURRENT_TIMESTAMP() WHERE exec_id='{pid}'")
+    ti.xcom_push(key='complete_sql', value=f"UPDATE `{REG_TABLE}` SET inp_sta='COMPLETED',err_msg=NULL,last_updated=CURRENT_TIMESTAMP() WHERE exec_id='{pid}'")
+    ti.xcom_push(key='validate_sql', value=f"SELECT IF((SELECT COUNT(*) FROM `{DEST_TABLE}` WHERE uuid='{usafe}')>0,'OK',ERROR('No rows ingested'))")
+
+# ══════════════════════════════════════════════════════════════
+# TASK 2: Build ingestion SQL — UUID check done in SQL, not Python
+#   • UUID already in table  → UPDATE updated_user / updated_ts only
+#   • New UUID               → INSERT rows (no MERGE, so same file +
+#                              different UUID always lands as fresh rows)
+#
+# NOTE: No Python bigquery.Client() call here — all BQ work is pushed
+#       into the SQL executed by BigQueryInsertJobOperator (Lumi SDK),
+#       which holds the correct project permissions.
+# ══════════════════════════════════════════════════════════════
+def build_sql(**ctx):
+    ti    = ctx['ti']
+    uris  = ti.xcom_pull(task_ids='parse_and_register', key='uris')  or []
+    hints = ti.xcom_pull(task_ids='parse_and_register', key='hints') or {}
+    uid   = ti.xcom_pull(task_ids='parse_and_register', key='uuid')
+    cb    = ti.xcom_pull(task_ids='parse_and_register', key='cb') or 'UNKNOWN'
+    usafe, usuf = uid.replace("'","''"), uid.replace("-","_")[:20]
+
+    validate_sql = ti.xcom_pull(task_ids='parse_and_register', key='validate_sql')
+    complete_sql = ti.xcom_pull(task_ids='parse_and_register', key='complete_sql')
+
+    # ── Read CSV headers from GCS (GCS client — no BQ permission needed) ──
+    bkt = storage.Client().bucket(BUCKET)
+    groups = {}
+    targets = uris if uris else [
+        f"gs://{BUCKET}/{b.name}" for b in bkt.list_blobs(prefix=PREFIX)
+        if b.name.lower().endswith('.csv') and '/processed/' not in b.name
+    ]
+    for uri in targets:
+        bp = uri.replace(f"gs://{BUCKET}/","")
+        try:
+            hdr = bkt.blob(bp).download_as_bytes(start=0, end=2048).decode('utf-8-sig', errors='ignore').split('\n')[0]
+            d = _delim(hdr)
+            cols = [c.strip().strip('"').strip() or f"_skip_{i}" for i,c in enumerate(hdr.split(d))]
+            scope = hints.get(uri) or _classify(bp.split('/')[-1])
+            if scope in ("state","country"):
+                groups.setdefault((scope, tuple(cols)), []).append(uri)
+                log.info(f"[DAG1] {bp.split('/')[-1]} → {scope}, {len(cols)} cols")
+        except Exception as e:
+            log.error(f"[DAG1] Error reading {uri}: {e}")
+
+    creates, sels, drops = [], [], []
+    for idx,((scope,ct),us) in enumerate(groups.items(),1):
+        cols = list(ct)
+        ext  = f"{PROJECT_ID}.{DATASET}._ext_{scope}_{usuf}_{idx}"
+        schema_str = ', '.join(f'`{c}` STRING' for c in cols)
+        uris_str   = ', '.join("'" + u + "'" for u in us)
+        creates.append(
+            f"DROP TABLE IF EXISTS `{ext}`; DROP EXTERNAL TABLE IF EXISTS `{ext}`; "
+            f"CREATE EXTERNAL TABLE `{ext}` ({schema_str}) "
+            f"OPTIONS(format='CSV',uris=[{uris_str}],skip_leading_rows=1);"
+        )
+        drops.append(f"DROP EXTERNAL TABLE IF EXISTS `{ext}`;")
+        cm  = {c.lower():c for c in cols}
+        d2  = cm.get('date2','date2')
+        dp  = (
+            # State: mm/dd/YYYY first, then slash dd/mm/yy, then dash variants
+            f"COALESCE("
+            f"SAFE_CAST(`{d2}` AS DATE),"
+            f"SAFE.PARSE_DATE('%m/%d/%Y',CAST(`{d2}` AS STRING)),"
+            f"SAFE.PARSE_DATE('%d/%m/%y',CAST(`{d2}` AS STRING)),"
+            f"SAFE.PARSE_DATE('%d-%m-%Y',CAST(`{d2}` AS STRING)),"
+            f"SAFE.PARSE_DATE('%m-%d-%Y',CAST(`{d2}` AS STRING)))"
+            if scope=="state" else
+            # National: dd/mm/yy first, then mm/dd/YYYY, then dash variants (covers '31-10-2018')
+            f"COALESCE("
+            f"SAFE_CAST(`{d2}` AS DATE),"
+            f"SAFE.PARSE_DATE('%d/%m/%y',CAST(`{d2}` AS STRING)),"
+            f"SAFE.PARSE_DATE('%d-%m-%Y',CAST(`{d2}` AS STRING)),"
+            f"SAFE.PARSE_DATE('%m/%d/%Y',CAST(`{d2}` AS STRING)),"
+            f"SAFE.PARSE_DATE('%m-%d-%Y',CAST(`{d2}` AS STRING)))"
+        )
+        cex    = ', '.join(
+            f"SAFE_CAST(NULLIF(`{cm[dc.lower()]}`,'#N/A') AS NUMERIC) AS {dc}" if dc.lower() in cm
+            else f"CAST(NULL AS NUMERIC) AS {dc}"
+            for dc in DATA_COLS
+        )
+        sc_col, cc_col = cm.get('state_cd'), cm.get('country_cd')
+        sc_e = f"`{sc_col}` AS state_cd"   if sc_col else "CAST(NULL AS STRING) AS state_cd"
+        cc_e = f"`{cc_col}` AS country_cd" if cc_col else "CAST(NULL AS STRING) AS country_cd"
+        mt   = 'NATIONAL' if scope=='country' else 'STATE'
+        sels.append(
+            f"SELECT '{usafe}' AS uuid,`{cm.get('scen','scen')}` AS scen,"
+            f"{cc_e},{sc_e},{dp} AS date2_parsed,{cex},"
+            f"'{cb}' AS created_user,'{mt}' AS macro_type "
+            f"FROM `{ext}` WHERE {dp} IS NOT NULL"
+        )
+
+    if sels:
+        union = " UNION ALL ".join(sels)
+        ins_cols = ','.join(DATA_COLS)   # used in both INSERT column list and SELECT value list
+        # ── SQL-level branching — no Python BQ client needed ──────────────
+        # Both DML statements are submitted; complementary WHERE clauses
+        # ensure exactly one path is effective per run:
+        #   UUID exists → UPDATE touches rows; INSERT NOT EXISTS → skips (0 rows)
+        #   UUID is new → UPDATE WHERE uuid=X → 0 rows (no-op); INSERT fires
+        sql = '\n'.join(creates) + f"""
+        -- Case A (same UUID re-upload): update metadata only
+        -- UPDATE is a no-op (0 rows) when UUID doesn't exist yet
+        UPDATE `{DEST_TABLE}`
+        SET updated_user='{cb}', updated_ts=CURRENT_TIMESTAMP()
+        WHERE uuid='{usafe}';
+
+        -- Case B (new UUID): insert rows only when UUID not yet present
+        -- INSERT is skipped (NOT EXISTS = false) when UUID already exists
+        INSERT INTO `{DEST_TABLE}` (uuid,created_user,scen,country_cd,state_cd,date2,{ins_cols},macro_type)
+        SELECT uuid,created_user,scen,country_cd,state_cd,date2_parsed,{ins_cols},macro_type
+        FROM (
+            SELECT *,ROW_NUMBER() OVER(
+                PARTITION BY scen,date2_parsed,COALESCE(state_cd,''),COALESCE(country_cd,'')
+                ORDER BY HPI DESC NULLS LAST
+            ) AS _rn FROM ({union})
+        ) WHERE _rn=1
+          AND NOT EXISTS (SELECT 1 FROM `{DEST_TABLE}` WHERE uuid='{usafe}' LIMIT 1);
+        """ + '\n'.join(drops) + f"\n{validate_sql};\n{complete_sql};"
+    else:
+        # No CSV files were classified as state or national.
+        # Raise so this task FAILS → mark_failed task fires → registry updated.
+        raise ValueError(
+            f"[DAG1] No valid state/national CSV files found for uuid={usafe}. "
+            "Check GCS path, file naming (S_/N_ prefix), and that files are not in /processed/."
+        )
+
+    log.info(
+        f"[DAG1] {sum(len(v) for (s,_),v in groups.items() if s=='state')} state + "
+        f"{sum(len(v) for (s,_),v in groups.items() if s=='country')} national files"
+    )
+    ti.xcom_push(key='merge_sql', value=sql)
+
+# ══════════════════════════════════════════════════════════════
+# TASK 3: On failure — mark registry + send Pub/Sub notification
+# ══════════════════════════════════════════════════════════════
+def handle_failure(**ctx):
+    ti = ctx['ti']
+    pid = ti.xcom_pull(task_ids='parse_and_register', key='pid') or ''
+    uid = ti.xcom_pull(task_ids='parse_and_register', key='uuid') or ''
+    mt = ti.xcom_pull(task_ids='parse_and_register', key='mt') or ''
+    try:
+        pub = pubsub_v1.PublisherClient()
+        pub.publish(pub.topic_path(PROJECT_ID,"LUMI_OUT_FAST_OutputStatus"),
+            data=json.dumps({"event_id":pid,"UUID":uid,"process_status":"FAILED","failure_source":"DAG1","macro_type":mt}).encode()).result()
+        log.info("[DAG1] Failure notification sent")
+    except Exception as e:
+        log.warning(f"[DAG1] Notify failed: {e}")
+
+# ══════════════════════════════════════════════════════════════
+# DAG Definition
+# ══════════════════════════════════════════════════════════════
+with DAG(dag_id='fast-e1-macro_data_ingestion_lumi_v7', schedule_interval=None,
+         start_date=days_ago(1), catchup=False, max_active_runs=1,
+         dagrun_timeout=timedelta(hours=2), tags=['lumi_sdk','macro_ingestion'],
+         default_args={'retries':2,'retry_delay':timedelta(seconds=60)}) as dag:
+
+    pull = PubSubPullOperator(task_id="pull_pubsub_message", project_id=PROJECT_ID,
+        subscription=SUB, max_messages=1, ack_messages=True)
+
+    parse = PythonOperator(task_id='parse_and_register', python_callable=check_msg)
+
+    init_reg = BigQueryInsertJobOperator(task_id='register_ingestion',
+        query="{{ ti.xcom_pull(task_ids='parse_and_register', key='init_sql') }}", sql_parameters={})
+
+    gcs_wait = GCSObjectsWithPrefixExistenceSensor(task_id='wait_for_csv_files', bucket=BUCKET,
+        prefix="{{ ti.xcom_pull(task_ids='parse_and_register', key='gcs_pfx') }}",
+        timeout=1800, poke_interval=60, mode='reschedule')
+
+    bld = PythonOperator(task_id='build_merge_sql', python_callable=build_sql)
+
+    merge = BigQueryInsertJobOperator(task_id='merge_validate_complete',
+        query="{{ ti.xcom_pull(task_ids='build_merge_sql', key='merge_sql') }}", sql_parameters={})
+
+    fail = BigQueryInsertJobOperator(task_id='mark_failed',
+        query="{{ ti.xcom_pull(task_ids='parse_and_register', key='fail_sql') }}",
+        sql_parameters={}, trigger_rule=TriggerRule.ONE_FAILED)
+
+    notify = PythonOperator(task_id='handle_failure', python_callable=handle_failure,
+        trigger_rule=TriggerRule.ALL_DONE)
+
+    # FLOW: pull(+ack) → parse_and_register → register → wait → build → merge_validate_complete
+    #        Any failure anywhere → mark_failed → handle_failure
+    pull >> parse >> init_reg >> gcs_wait >> bld >> merge
+    # Wire both bld AND merge to fail so mark_failed triggers
+    # even when build_merge_sql itself errors (not just when merge errors)
+    [bld, merge] >> fail >> notify
